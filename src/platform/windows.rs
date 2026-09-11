@@ -166,6 +166,11 @@ mod image_data {
 		}
 	}
 
+	fn read_dibv5_header(dibv5: &[u8]) -> BITMAPV5HEADER {
+		assert!(dibv5.len() >= size_of::<BITMAPV5HEADER>());
+		unsafe { std::ptr::read_unaligned(dibv5.as_ptr().cast::<BITMAPV5HEADER>()) }
+	}
+
 	// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv5header
 	// According to the docs, when bV5Compression is BI_RGB, "the high byte in each DWORD
 	// is not used".
@@ -176,9 +181,8 @@ mod image_data {
 	// Apparently, it's our job as the consumer to do the right thing. This method fiddles
 	// with the header a bit in these cases, then `image` handles the rest.
 	fn maybe_tweak_header(dibv5: &mut [u8]) {
-		assert!(dibv5.len() >= size_of::<BITMAPV5HEADER>());
 		let src = dibv5.as_mut_ptr().cast::<BITMAPV5HEADER>();
-		let mut header = unsafe { std::ptr::read_unaligned(src) };
+		let mut header = read_dibv5_header(dibv5);
 
 		if header.bV5BitCount == 32
 			&& header.bV5Compression == BI_RGB
@@ -195,6 +199,59 @@ mod image_data {
 		}
 	}
 
+	const BMP_FILE_HEADER_SIZE: usize = 14;
+	const RGB_BITFIELD_MASK_BYTES: usize = 12;
+
+	fn has_post_header_bitfield_masks(dibv5: &[u8], header: &BITMAPV5HEADER) -> bool {
+		if header.bV5Compression != BI_BITFIELDS {
+			return false;
+		}
+
+		let header_size = size_of::<BITMAPV5HEADER>();
+		let Some(candidate) = dibv5.get(header_size..header_size + RGB_BITFIELD_MASK_BYTES) else {
+			return false;
+		};
+
+		let mut expected = [0u8; RGB_BITFIELD_MASK_BYTES];
+		expected[0..4].copy_from_slice(&header.bV5RedMask.to_le_bytes());
+		expected[4..8].copy_from_slice(&header.bV5GreenMask.to_le_bytes());
+		expected[8..12].copy_from_slice(&header.bV5BlueMask.to_le_bytes());
+		candidate == expected.as_slice()
+	}
+
+	fn dibv5_with_file_header(
+		dibv5: &[u8],
+		check_post_header_masks: bool,
+	) -> Result<Vec<u8>, Error> {
+		let header = read_dibv5_header(dibv5);
+		let post_header_mask_bytes =
+			if check_post_header_masks && has_post_header_bitfield_masks(dibv5, &header) {
+				RGB_BITFIELD_MASK_BYTES
+			} else {
+				0
+			};
+
+		let dib_pixel_offset = size_of::<BITMAPV5HEADER>()
+			.checked_add(post_header_mask_bytes)
+			.ok_or(Error::ConversionFailure)?;
+		let file_size = BMP_FILE_HEADER_SIZE
+			.checked_add(dibv5.len())
+			.ok_or(Error::ConversionFailure)?;
+		let pixel_offset = BMP_FILE_HEADER_SIZE
+			.checked_add(dib_pixel_offset)
+			.ok_or(Error::ConversionFailure)?;
+		let file_size: u32 = file_size.try_into().map_err(|_| Error::ConversionFailure)?;
+		let pixel_offset: u32 = pixel_offset.try_into().map_err(|_| Error::ConversionFailure)?;
+
+		let mut bmp = Vec::with_capacity(file_size as usize);
+		bmp.extend_from_slice(b"BM");
+		bmp.extend_from_slice(&file_size.to_le_bytes());
+		bmp.extend_from_slice(&[0; 4]);
+		bmp.extend_from_slice(&pixel_offset.to_le_bytes());
+		bmp.extend_from_slice(dibv5);
+		Ok(bmp)
+	}
+
 	pub(super) fn read_cf_dibv5(dibv5: &mut [u8]) -> Result<ImageData<'static>, Error> {
 		// The DIBV5 format is a BITMAPV5HEADER followed by the pixel data according to
 		// https://docs.microsoft.com/en-us/windows/win32/dataxchg/standard-clipboard-formats
@@ -203,10 +260,17 @@ mod image_data {
 		if dibv5.len() < header_size {
 			return Err(Error::unknown("When reading the DIBV5 data, it contained fewer bytes than the BITMAPV5HEADER size. This is invalid."));
 		}
+
+		let source_was_bitfields = read_dibv5_header(dibv5).bV5Compression == BI_BITFIELDS;
 		maybe_tweak_header(dibv5);
 
-		let decoder = BmpDecoder::new_without_file_header(std::io::Cursor::new(&*dibv5))
-			.map_err(|_| Error::ConversionFailure)?;
+		// Windows clipboard producers use both DIBV5 layouts seen in the wild: pixel data may
+		// follow the 124-byte V5 header directly, or a producer may repeat the RGB masks after
+		// the header. Supplying a BITMAPFILEHEADER with an explicit pixel offset avoids relying
+		// on the BMP decoder to infer which layout was used.
+		let bmp = dibv5_with_file_header(dibv5, source_was_bitfields)?;
+		let decoder =
+			BmpDecoder::new(std::io::Cursor::new(bmp)).map_err(|_| Error::ConversionFailure)?;
 		let (width, height) = decoder.dimensions();
 		let bytes = DynamicImage::from_decoder(decoder)
 			.map_err(|_| Error::ConversionFailure)?
@@ -442,6 +506,87 @@ mod image_data {
 			100,
 		];
 		assert_eq!(image.bytes, EXPECTED);
+	}
+
+	fn synthetic_dibv5(
+		compression: u32,
+		embed_rgb_masks: bool,
+		post_header_masks: bool,
+	) -> Vec<u8> {
+		const RED_MASK: u32 = 0x00ff0000;
+		const GREEN_MASK: u32 = 0x0000ff00;
+		const BLUE_MASK: u32 = 0x000000ff;
+		const ALPHA_MASK: u32 = 0xff000000;
+
+		let header_size = size_of::<BITMAPV5HEADER>();
+		let mut raw = vec![0u8; header_size];
+		raw[0..4].copy_from_slice(&(header_size as u32).to_le_bytes());
+		raw[4..8].copy_from_slice(&2i32.to_le_bytes());
+		raw[8..12].copy_from_slice(&2i32.to_le_bytes());
+		raw[12..14].copy_from_slice(&1u16.to_le_bytes());
+		raw[14..16].copy_from_slice(&32u16.to_le_bytes());
+		raw[16..20].copy_from_slice(&compression.to_le_bytes());
+		raw[52..56].copy_from_slice(&ALPHA_MASK.to_le_bytes());
+		raw[56..60].copy_from_slice(&0x73524742u32.to_le_bytes());
+
+		if embed_rgb_masks {
+			raw[40..44].copy_from_slice(&RED_MASK.to_le_bytes());
+			raw[44..48].copy_from_slice(&GREEN_MASK.to_le_bytes());
+			raw[48..52].copy_from_slice(&BLUE_MASK.to_le_bytes());
+		}
+
+		if post_header_masks {
+			raw.extend_from_slice(&RED_MASK.to_le_bytes());
+			raw.extend_from_slice(&GREEN_MASK.to_le_bytes());
+			raw.extend_from_slice(&BLUE_MASK.to_le_bytes());
+		}
+
+		// DIB rows are bottom-up for a positive height. Store blue/green on the bottom
+		// row and red/white on the top row so row-order bugs are visible too.
+		raw.extend_from_slice(&[
+			255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 255, 32,
+		]);
+		raw
+	}
+
+	const SYNTHETIC_EXPECTED: &[u8] = &[
+		255, 0, 0, 64, 255, 255, 255, 32, 0, 0, 255, 255, 0, 255, 0, 128,
+	];
+
+	#[test]
+	fn pixpin_style_dibv5_without_post_header_masks() {
+		let mut raw = synthetic_dibv5(BI_RGB, false, false);
+		let image = read_cf_dibv5(&mut raw).unwrap();
+
+		assert_eq!(image.width, 2);
+		assert_eq!(image.height, 2);
+		assert_eq!(image.bytes, SYNTHETIC_EXPECTED);
+	}
+
+	#[test]
+	fn bitfields_dibv5_without_post_header_masks() {
+		let mut raw = synthetic_dibv5(BI_BITFIELDS, true, false);
+		let image = read_cf_dibv5(&mut raw).unwrap();
+
+		assert_eq!(image.width, 2);
+		assert_eq!(image.height, 2);
+		assert_eq!(image.bytes, SYNTHETIC_EXPECTED);
+	}
+
+	#[test]
+	fn bitfields_dibv5_with_post_header_masks() {
+		let mut raw = synthetic_dibv5(BI_BITFIELDS, true, true);
+		let image = read_cf_dibv5(&mut raw).unwrap();
+
+		assert_eq!(image.width, 2);
+		assert_eq!(image.height, 2);
+		assert_eq!(image.bytes, SYNTHETIC_EXPECTED);
+	}
+
+	#[test]
+	fn truncated_dibv5_is_rejected() {
+		let mut raw = vec![0; size_of::<BITMAPV5HEADER>() - 1];
+		assert!(read_cf_dibv5(&mut raw).is_err());
 	}
 }
 
@@ -897,12 +1042,23 @@ impl<'clipboard> Clear<'clipboard> {
 
 fn wrap_html(ctn: &str) -> String {
 	let h_version = "Version:0.9";
-	let h_start_html = "\r\nStartHTML:";
-	let h_end_html = "\r\nEndHTML:";
-	let h_start_frag = "\r\nStartFragment:";
-	let h_end_frag = "\r\nEndFragment:";
-	let c_start_frag = "\r\n<html>\r\n<body>\r\n<!--StartFragment-->\r\n";
-	let c_end_frag = "\r\n<!--EndFragment-->\r\n</body>\r\n</html>";
+	let h_start_html = "\r\
+StartHTML:";
+	let h_end_html = "\r\
+EndHTML:";
+	let h_start_frag = "\r\
+StartFragment:";
+	let h_end_frag = "\r\
+EndFragment:";
+	let c_start_frag = "\r\
+<html>\r\
+<body>\r\
+<!--StartFragment-->\r\
+";
+	let c_end_frag = "\r\
+<!--EndFragment-->\r\
+</body>\r\
+</html>";
 	let h_len = h_version.len()
 		+ h_start_html.len()
 		+ 10 + h_end_html.len()
