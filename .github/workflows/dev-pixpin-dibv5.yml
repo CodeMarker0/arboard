@@ -1,0 +1,296 @@
+name: Validate PixPin DIBV5 fix
+
+on:
+  push:
+    branches: [ fix/windows-pixpin-dibv5 ]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    runs-on: windows-latest
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: fix/windows-pixpin-dibv5
+
+      - name: Apply development patch
+        shell: python
+        run: |
+          from pathlib import Path
+
+          path = Path("src/platform/windows.rs")
+          source = path.read_text(encoding="utf-8")
+          marker = "fn dibv5_with_file_header("
+          if marker in source:
+              print("Patch already applied")
+              raise SystemExit(0)
+
+          old_tweak = '''\tfn maybe_tweak_header(dibv5: &mut [u8]) {
+          \t\tassert!(dibv5.len() >= size_of::<BITMAPV5HEADER>());
+          \t\tlet src = dibv5.as_mut_ptr().cast::<BITMAPV5HEADER>();
+          \t\tlet mut header = unsafe { std::ptr::read_unaligned(src) };
+
+          \t\tif header.bV5BitCount == 32
+          \t\t\t&& header.bV5Compression == BI_RGB
+          \t\t\t&& header.bV5AlphaMask == 0xff000000
+          \t\t{
+          \t\t\theader.bV5Compression = BI_BITFIELDS;
+          \t\t\tif header.bV5RedMask == 0 && header.bV5GreenMask == 0 && header.bV5BlueMask == 0 {
+          \t\t\t\theader.bV5RedMask = 0xff0000;
+          \t\t\t\theader.bV5GreenMask = 0xff00;
+          \t\t\t\theader.bV5BlueMask = 0xff;
+          \t\t\t}
+
+          \t\t\tunsafe { std::ptr::write_unaligned(src, header) };
+          \t\t}
+          \t}
+          '''
+
+          new_tweak = '''\tfn read_dibv5_header(dibv5: &[u8]) -> BITMAPV5HEADER {
+          \t\tassert!(dibv5.len() >= size_of::<BITMAPV5HEADER>());
+          \t\tunsafe { std::ptr::read_unaligned(dibv5.as_ptr().cast::<BITMAPV5HEADER>()) }
+          \t}
+
+          \tfn maybe_tweak_header(dibv5: &mut [u8]) {
+          \t\tlet src = dibv5.as_mut_ptr().cast::<BITMAPV5HEADER>();
+          \t\tlet mut header = read_dibv5_header(dibv5);
+
+          \t\tif header.bV5BitCount == 32
+          \t\t\t&& header.bV5Compression == BI_RGB
+          \t\t\t&& header.bV5AlphaMask == 0xff000000
+          \t\t{
+          \t\t\theader.bV5Compression = BI_BITFIELDS;
+          \t\t\tif header.bV5RedMask == 0 && header.bV5GreenMask == 0 && header.bV5BlueMask == 0 {
+          \t\t\t\theader.bV5RedMask = 0xff0000;
+          \t\t\t\theader.bV5GreenMask = 0xff00;
+          \t\t\t\theader.bV5BlueMask = 0xff;
+          \t\t\t}
+
+          \t\t\tunsafe { std::ptr::write_unaligned(src, header) };
+          \t\t}
+          \t}
+
+          \tconst BMP_FILE_HEADER_SIZE: usize = 14;
+          \tconst RGB_BITFIELD_MASK_BYTES: usize = 12;
+
+          \tfn has_post_header_bitfield_masks(dibv5: &[u8], header: &BITMAPV5HEADER) -> bool {
+          \t\tif header.bV5Compression != BI_BITFIELDS {
+          \t\t\treturn false;
+          \t\t}
+
+          \t\tlet header_size = size_of::<BITMAPV5HEADER>();
+          \t\tlet Some(candidate) = dibv5.get(header_size..header_size + RGB_BITFIELD_MASK_BYTES)
+          \t\telse {
+          \t\t\treturn false;
+          \t\t};
+
+          \t\tlet mut expected = [0u8; RGB_BITFIELD_MASK_BYTES];
+          \t\texpected[0..4].copy_from_slice(&header.bV5RedMask.to_le_bytes());
+          \t\texpected[4..8].copy_from_slice(&header.bV5GreenMask.to_le_bytes());
+          \t\texpected[8..12].copy_from_slice(&header.bV5BlueMask.to_le_bytes());
+          \t\tcandidate == expected.as_slice()
+          \t}
+
+          \tfn dibv5_with_file_header(
+          \t\tdibv5: &[u8],
+          \t\tcheck_post_header_masks: bool,
+          \t) -> Result<Vec<u8>, Error> {
+          \t\tlet header = read_dibv5_header(dibv5);
+          \t\tlet post_header_mask_bytes =
+          \t\t\tif check_post_header_masks && has_post_header_bitfield_masks(dibv5, &header) {
+          \t\t\t\tRGB_BITFIELD_MASK_BYTES
+          \t\t\t} else {
+          \t\t\t\t0
+          \t\t\t};
+
+          \t\tlet dib_pixel_offset = size_of::<BITMAPV5HEADER>()
+          \t\t\t.checked_add(post_header_mask_bytes)
+          \t\t\t.ok_or(Error::ConversionFailure)?;
+          \t\tlet file_size = BMP_FILE_HEADER_SIZE
+          \t\t\t.checked_add(dibv5.len())
+          \t\t\t.ok_or(Error::ConversionFailure)?;
+          \t\tlet pixel_offset = BMP_FILE_HEADER_SIZE
+          \t\t\t.checked_add(dib_pixel_offset)
+          \t\t\t.ok_or(Error::ConversionFailure)?;
+          \t\tlet file_size: u32 = file_size.try_into().map_err(|_| Error::ConversionFailure)?;
+          \t\tlet pixel_offset: u32 =
+          \t\t\tpixel_offset.try_into().map_err(|_| Error::ConversionFailure)?;
+
+          \t\tlet mut bmp = Vec::with_capacity(file_size as usize);
+          \t\tbmp.extend_from_slice(b"BM");
+          \t\tbmp.extend_from_slice(&file_size.to_le_bytes());
+          \t\tbmp.extend_from_slice(&[0; 4]);
+          \t\tbmp.extend_from_slice(&pixel_offset.to_le_bytes());
+          \t\tbmp.extend_from_slice(dibv5);
+          \t\tOk(bmp)
+          \t}
+          '''
+
+          if old_tweak not in source:
+              raise RuntimeError("could not find maybe_tweak_header block")
+          source = source.replace(old_tweak, new_tweak, 1)
+
+          old_decode = '''\t\tmaybe_tweak_header(dibv5);
+
+          \t\tlet decoder = BmpDecoder::new_without_file_header(std::io::Cursor::new(&*dibv5))
+          \t\t\t.map_err(|_| Error::ConversionFailure)?;
+          '''
+          new_decode = '''\t\tlet source_was_bitfields = read_dibv5_header(dibv5).bV5Compression == BI_BITFIELDS;
+          \t\tmaybe_tweak_header(dibv5);
+
+          \t\t// Windows clipboard producers use both of the DIBV5 layouts seen in the wild:
+          \t\t// pixel data may follow the 124-byte V5 header directly, or a producer may repeat
+          \t\t// the RGB masks after the header. Supplying a BITMAPFILEHEADER with an explicit
+          \t\t// pixel offset avoids relying on the BMP decoder to infer which layout was used.
+          \t\tlet bmp = dibv5_with_file_header(dibv5, source_was_bitfields)?;
+          \t\tlet decoder =
+          \t\t\tBmpDecoder::new(std::io::Cursor::new(bmp)).map_err(|_| Error::ConversionFailure)?;
+          '''
+          if old_decode not in source:
+              raise RuntimeError("could not find read_cf_dibv5 decoder block")
+          source = source.replace(old_decode, new_decode, 1)
+
+          test_anchor = '''\t\tassert_eq!(image.bytes, EXPECTED);
+          \t}
+          }
+
+          unsafe fn global_alloc'''
+          tests = '''\t\tassert_eq!(image.bytes, EXPECTED);
+          \t}
+
+          \tfn synthetic_dibv5(compression: u32, embed_rgb_masks: bool, post_header_masks: bool) -> Vec<u8> {
+          \t\tconst RED_MASK: u32 = 0x00ff0000;
+          \t\tconst GREEN_MASK: u32 = 0x0000ff00;
+          \t\tconst BLUE_MASK: u32 = 0x000000ff;
+          \t\tconst ALPHA_MASK: u32 = 0xff000000;
+
+          \t\tlet header_size = size_of::<BITMAPV5HEADER>();
+          \t\tlet mut raw = vec![0u8; header_size];
+          \t\traw[0..4].copy_from_slice(&(header_size as u32).to_le_bytes());
+          \t\traw[4..8].copy_from_slice(&2i32.to_le_bytes());
+          \t\traw[8..12].copy_from_slice(&2i32.to_le_bytes());
+          \t\traw[12..14].copy_from_slice(&1u16.to_le_bytes());
+          \t\traw[14..16].copy_from_slice(&32u16.to_le_bytes());
+          \t\traw[16..20].copy_from_slice(&compression.to_le_bytes());
+          \t\traw[52..56].copy_from_slice(&ALPHA_MASK.to_le_bytes());
+          \t\traw[56..60].copy_from_slice(&0x73524742u32.to_le_bytes());
+
+          \t\tif embed_rgb_masks {
+          \t\t\traw[40..44].copy_from_slice(&RED_MASK.to_le_bytes());
+          \t\t\traw[44..48].copy_from_slice(&GREEN_MASK.to_le_bytes());
+          \t\t\traw[48..52].copy_from_slice(&BLUE_MASK.to_le_bytes());
+          \t\t}
+
+          \t\tif post_header_masks {
+          \t\t\traw.extend_from_slice(&RED_MASK.to_le_bytes());
+          \t\t\traw.extend_from_slice(&GREEN_MASK.to_le_bytes());
+          \t\t\traw.extend_from_slice(&BLUE_MASK.to_le_bytes());
+          \t\t}
+
+          \t\t// DIB rows are bottom-up for a positive height. Store blue/green on the bottom
+          \t\t// row and red/white on the top row so row-order bugs are visible too.
+          \t\traw.extend_from_slice(&[
+          \t\t\t255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 64, 255, 255, 255, 32,
+          \t\t]);
+          \t\traw
+          \t}
+
+          \tconst SYNTHETIC_EXPECTED: &[u8] = &[
+          \t\t255, 0, 0, 64, 255, 255, 255, 32, 0, 0, 255, 255, 0, 255, 0, 128,
+          \t];
+
+          \t#[test]
+          \tfn pixpin_style_dibv5_without_post_header_masks() {
+          \t\tlet mut raw = synthetic_dibv5(BI_RGB, false, false);
+          \t\tlet image = read_cf_dibv5(&mut raw).unwrap();
+
+          \t\tassert_eq!(image.width, 2);
+          \t\tassert_eq!(image.height, 2);
+          \t\tassert_eq!(image.bytes, SYNTHETIC_EXPECTED);
+          \t}
+
+          \t#[test]
+          \tfn bitfields_dibv5_without_post_header_masks() {
+          \t\tlet mut raw = synthetic_dibv5(BI_BITFIELDS, true, false);
+          \t\tlet image = read_cf_dibv5(&mut raw).unwrap();
+
+          \t\tassert_eq!(image.width, 2);
+          \t\tassert_eq!(image.height, 2);
+          \t\tassert_eq!(image.bytes, SYNTHETIC_EXPECTED);
+          \t}
+
+          \t#[test]
+          \tfn bitfields_dibv5_with_post_header_masks() {
+          \t\tlet mut raw = synthetic_dibv5(BI_BITFIELDS, true, true);
+          \t\tlet image = read_cf_dibv5(&mut raw).unwrap();
+
+          \t\tassert_eq!(image.width, 2);
+          \t\tassert_eq!(image.height, 2);
+          \t\tassert_eq!(image.bytes, SYNTHETIC_EXPECTED);
+          \t}
+
+          \t#[test]
+          \tfn truncated_dibv5_is_rejected() {
+          \t\tlet mut raw = vec![0; size_of::<BITMAPV5HEADER>() - 1];
+          \t\tassert!(read_cf_dibv5(&mut raw).is_err());
+          \t}
+          }
+
+          unsafe fn global_alloc'''
+          if test_anchor not in source:
+              raise RuntimeError("could not find image test module end")
+          source = source.replace(test_anchor, tests, 1)
+
+          path.write_text(source, encoding="utf-8", newline="\n")
+
+      - uses: step-security/setup-rust-toolchain@a8823c6cdb5668ac7528d7756acfee772bf71809 # v1.16.1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check diff whitespace
+        run: git diff --check
+
+      - name: Clippy with locked dependencies
+        run: cargo clippy --verbose --all-features -- -D warnings -D clippy::dbg_macro
+
+      - name: Test with locked dependencies
+        run: cargo test --all-features
+
+      - name: Test with latest compatible image 0.25.x
+        shell: pwsh
+        run: |
+          cargo update -p image
+          cargo test --no-default-features --features image-data
+          git checkout -- Cargo.lock
+
+      - uses: step-security/setup-rust-toolchain@a8823c6cdb5668ac7528d7756acfee772bf71809 # v1.16.1
+        with:
+          toolchain: "1.71.0"
+          components: clippy
+
+      - name: Check MSRV
+        run: cargo clippy --verbose --all-features -- -D warnings -D clippy::dbg_macro
+
+      - name: Commit validated source change
+        shell: pwsh
+        run: |
+          if (git diff --quiet -- src/platform/windows.rs) {
+            Write-Host "No source changes to commit"
+            exit 0
+          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/platform/windows.rs
+          git commit -m "fix(windows): handle DIBV5 pixel offsets explicitly"
+          git push origin HEAD:fix/windows-pixpin-dibv5
